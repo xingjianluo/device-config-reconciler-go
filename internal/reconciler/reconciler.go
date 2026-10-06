@@ -7,29 +7,46 @@ import (
 	"time"
 
 	"github.com/xingjianluo/device-config-reconciler-go/internal/classify"
-	"github.com/xingjianluo/device-config-reconciler-go/internal/device"
 	"github.com/xingjianluo/device-config-reconciler-go/internal/model"
 	"github.com/xingjianluo/device-config-reconciler-go/internal/storage"
 )
+
+// DeviceClient is the subset of the device surface used by the reconciler. The
+// production implementation is *device.Client; tests may wrap it to count or
+// block device calls.
+type DeviceClient interface {
+	Get(deviceID, feature string) (model.DeviceState, bool)
+	Apply(deviceID, feature string, spec model.Spec, gen int64) error
+	Cleanup(deviceID, feature string) error
+}
 
 // Reconciler processes one object (device/feature) at a time under a per-object
 // lock. Concurrent Process calls for the same object are serialized, so the
 // device cannot receive duplicate operations and generations cannot be
 // double-recorded; different objects proceed in parallel.
+//
+// Generational gating: every intent (PUT/DELETE) carrying a positive Generation
+// is ordered per object. An event whose generation is older than an intent
+// already accepted is acknowledged as Stale without touching the device, so a
+// late/duplicated old change can never roll state backwards. tombstones
+// remember the generation of the latest completed DELETE so that an old PUT
+// arriving after that DELETE cannot resurrect a deleted object; a newer PUT
+// clears the tombstone again (delete/recreate interleaving).
 type Reconciler struct {
-	store  storage.Store
-	client *device.Client
-
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	store      storage.Store
+	client     DeviceClient
+	locksMu    sync.Mutex
+	locks      map[string]*sync.Mutex
+	tombstones map[string]int64
 }
 
 // New builds a Reconciler over the given store and device client.
-func New(store storage.Store, client *device.Client) *Reconciler {
+func New(store storage.Store, client DeviceClient) *Reconciler {
 	return &Reconciler{
-		store:  store,
-		client: client,
-		locks:  make(map[string]*sync.Mutex),
+		store:      store,
+		client:     client,
+		locks:      make(map[string]*sync.Mutex),
+		tombstones: make(map[string]int64),
 	}
 }
 
@@ -86,6 +103,23 @@ func (r *Reconciler) handlePut(ev model.Event) model.ActionResult {
 		res := r.fail(ev, model.ActionNone, classify.NewPermanent("PUT event missing spec"))
 		return res
 	}
+	key := ev.DeviceID + "/" + ev.Feature
+
+	// Generational ordering against a newer intent already accepted.
+	if ev.Generation > 0 {
+		if newer, ok := r.store.GetDesired(ev.DeviceID, ev.Feature); ok && newer.Generation > ev.Generation {
+			return r.stale(ev, "stale PUT gen "+strconv.FormatInt(ev.Generation, 10)+
+				", newer desired gen "+strconv.FormatInt(newer.Generation, 10)+" retained")
+		}
+		r.locksMu.Lock()
+		tombGen := r.tombstones[key]
+		r.locksMu.Unlock()
+		if tombGen >= ev.Generation {
+			return r.stale(ev, "stale PUT gen "+strconv.FormatInt(ev.Generation, 10)+
+				", object deleted at gen "+strconv.FormatInt(tombGen, 10))
+		}
+	}
+
 	// Persist intent before acting: a crash/re-delivery repeats the converge
 	// step rather than losing the desired change.
 	r.store.PutDesired(model.DesiredConfig{
@@ -95,13 +129,38 @@ func (r *Reconciler) handlePut(ev model.Event) model.ActionResult {
 		Generation: ev.Generation,
 		UpdatedAt:  time.Now(),
 	})
+	// A fresh intent supersedes any prior deletion: the tombstone must not
+	// reject the recreate.
+	if ev.Generation > 0 {
+		r.locksMu.Lock()
+		delete(r.tombstones, key)
+		r.locksMu.Unlock()
+	}
 	return r.converge(ev.DeviceID, ev.Feature, ev.Generation, 0)
 }
 
 func (r *Reconciler) handleDelete(ev model.Event) model.ActionResult {
+	key := ev.DeviceID + "/" + ev.Feature
+
+	// A versioned DELETE older than a still-present desired intent is stale: it
+	// must neither remove the desired config nor touch the device.
+	if ev.Generation > 0 {
+		if newer, ok := r.store.GetDesired(ev.DeviceID, ev.Feature); ok && newer.Generation > ev.Generation {
+			return r.stale(ev, "stale DELETE gen "+strconv.FormatInt(ev.Generation, 10)+
+				", newer desired gen "+strconv.FormatInt(newer.Generation, 10)+" retained")
+		}
+	}
+
 	// Intent to delete is recorded up front; repeated DELETE events simply
 	// re-attempt the cleanup until it is confirmed done.
 	r.store.DeleteDesired(ev.DeviceID, ev.Feature)
+	if ev.Generation > 0 {
+		r.locksMu.Lock()
+		if ev.Generation > r.tombstones[key] {
+			r.tombstones[key] = ev.Generation
+		}
+		r.locksMu.Unlock()
+	}
 
 	state, exists := r.client.Get(ev.DeviceID, ev.Feature)
 	_ = state
@@ -226,6 +285,21 @@ func validate(spec model.Spec) error {
 
 func (r *Reconciler) fail(ev model.Event, action model.ActionKind, err *classify.Error) model.ActionResult {
 	return r.failWithErr(ev, action, err)
+}
+
+// stale acknowledges an out-of-order old event without changing any state. It
+// is intentionally NOT passed to store.RecordResult: an object's latest
+// externally visible result must belong to its newest intent.
+func (r *Reconciler) stale(ev model.Event, reason string) model.ActionResult {
+	return model.ActionResult{
+		DeviceID:   ev.DeviceID,
+		Feature:    ev.Feature,
+		Generation: ev.Generation,
+		Action:     model.ActionNone,
+		Converged:  true,
+		Reason:     reason,
+		Stale:      true,
+	}
 }
 
 func (r *Reconciler) failWithErr(ev model.Event, action model.ActionKind, err error) model.ActionResult {

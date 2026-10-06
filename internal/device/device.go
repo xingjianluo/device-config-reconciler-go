@@ -21,6 +21,11 @@ type Client struct {
 	states            map[string]model.DeviceState
 	transientFailures map[string]int
 	permanentFailures map[string]bool
+	// applyHook / cleanupHook, when set, run at the start of Apply/Cleanup
+	// while the client lock is held. Tests use them to block an in-flight
+	// device call and deterministically interleave freshly arriving events.
+	applyHook   func(deviceID, feature string)
+	cleanupHook func(deviceID, feature string)
 }
 
 // NewClient creates an empty simulated device client.
@@ -48,6 +53,9 @@ func (c *Client) Apply(deviceID, feature string, spec model.Spec, gen int64) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := k(deviceID, feature)
+	if c.applyHook != nil {
+		c.applyHook(deviceID, feature)
+	}
 	if err := c.failure(key); err != nil {
 		return err
 	}
@@ -65,6 +73,9 @@ func (c *Client) Cleanup(deviceID, feature string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := k(deviceID, feature)
+	if c.cleanupHook != nil {
+		c.cleanupHook(deviceID, feature)
+	}
 	if err := c.failure(key); err != nil {
 		return err
 	}
@@ -121,4 +132,20 @@ func (c *Client) ResetFailures(deviceID, feature string) {
 	key := k(deviceID, feature)
 	delete(c.transientFailures, key)
 	delete(c.permanentFailures, key)
+}
+
+// SetApplyHook installs a test hook invoked at the start of every Apply while
+// the client lock is held; pass nil to clear it.
+func (c *Client) SetApplyHook(h func(deviceID, feature string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.applyHook = h
+}
+
+// SetCleanupHook installs a test hook invoked at the start of every Cleanup
+// while the client lock is held; pass nil to clear it.
+func (c *Client) SetCleanupHook(h func(deviceID, feature string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupHook = h
 }

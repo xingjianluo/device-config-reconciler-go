@@ -75,6 +75,11 @@ type ActionResult struct {
 	ErrClass   ErrorClass
 	Reason     string
 	Attempt    int
+	// Stale marks an event whose generation is older than a newer intent already
+	// accepted for the object. It must not change device state nor overwrite the
+	// object's latest externally visible result; it is acknowledged (not silently
+	// dropped) and the latest intent is re-converged by its own claim.
+	Stale bool
 }
 
 // Event is a unit of work delivered to the reconciler.
@@ -87,7 +92,9 @@ type Event struct {
 	Feature  string
 	// Spec is populated for PUT events; ignored otherwise.
 	Spec *Spec
-	// Generation is carried by PUT events and is stored with the desired config.
+	// Generation orders intents per object for PUT and (recommended) DELETE.
+	// A positive generation enables stale-event rejection and delete tombstones;
+	// zero preserves legacy last-write-wins behavior.
 	Generation int64
 }
 
