@@ -21,6 +21,8 @@ type Client struct {
 	states            map[string]model.DeviceState
 	transientFailures map[string]int
 	permanentFailures map[string]bool
+	applyCounts       map[string]int
+	cleanupCounts     map[string]int
 }
 
 // NewClient creates an empty simulated device client.
@@ -29,6 +31,8 @@ func NewClient() *Client {
 		states:            make(map[string]model.DeviceState),
 		transientFailures: make(map[string]int),
 		permanentFailures: make(map[string]bool),
+		applyCounts:       make(map[string]int),
+		cleanupCounts:     make(map[string]int),
 	}
 }
 
@@ -48,6 +52,7 @@ func (c *Client) Apply(deviceID, feature string, spec model.Spec, gen int64) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := k(deviceID, feature)
+	c.applyCounts[key]++
 	if err := c.failure(key); err != nil {
 		return err
 	}
@@ -65,6 +70,7 @@ func (c *Client) Cleanup(deviceID, feature string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := k(deviceID, feature)
+	c.cleanupCounts[key]++
 	if err := c.failure(key); err != nil {
 		return err
 	}
@@ -121,4 +127,20 @@ func (c *Client) ResetFailures(deviceID, feature string) {
 	key := k(deviceID, feature)
 	delete(c.transientFailures, key)
 	delete(c.permanentFailures, key)
+}
+
+// ApplyCount reports how many Apply calls (successful or not) were issued
+// towards an object. It is a test helper for asserting that coalescing and
+// idempotency keep the number of device operations bounded.
+func (c *Client) ApplyCount(deviceID, feature string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.applyCounts[k(deviceID, feature)]
+}
+
+// CleanupCount reports how many Cleanup calls were issued towards an object.
+func (c *Client) CleanupCount(deviceID, feature string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cleanupCounts[k(deviceID, feature)]
 }

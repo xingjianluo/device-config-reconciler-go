@@ -86,6 +86,20 @@ func (r *Reconciler) handlePut(ev model.Event) model.ActionResult {
 		res := r.fail(ev, model.ActionNone, classify.NewPermanent("PUT event missing spec"))
 		return res
 	}
+	// Out-of-order guard: a late-arriving PUT whose generation is older than
+	// the stored desired generation must never drag the object backwards. It
+	// is not silently dropped either: convergence is re-driven towards the
+	// newest known generation, so the object cannot strand at an intermediate
+	// value even if the newest event's own delivery is still being retried.
+	if existing, ok := r.store.GetDesired(ev.DeviceID, ev.Feature); ok && ev.Generation < existing.Generation {
+		res := r.converge(ev.DeviceID, ev.Feature, existing.Generation, 0)
+		if res.Converged {
+			res.Reason = "stale PUT gen=" + strconv.FormatInt(ev.Generation, 10) +
+				" superseded by gen=" + strconv.FormatInt(existing.Generation, 10)
+			r.store.RecordResult(res)
+		}
+		return res
+	}
 	// Persist intent before acting: a crash/re-delivery repeats the converge
 	// step rather than losing the desired change.
 	r.store.PutDesired(model.DesiredConfig{

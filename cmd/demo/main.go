@@ -77,4 +77,39 @@ func main() {
 	del("d1", "dev-D")
 	w.Drain()
 	show("delete       ", "dev-D")
+
+	// 7. out-of-order flood: many generations of one object arrive shuffled
+	// and duplicated; the device must converge to the highest generation.
+	for _, gen := range []int64{5, 2, 4, 1, 3, 5, 2} {
+		put(fmt.Sprintf("f%d", gen), "dev-E", gen, gen*10)
+	}
+	w.Drain()
+	show("out-of-order ", "dev-E")
+
+	// 8. delete/recreate interleaved: PUT, DELETE, PUT back-to-back; the last
+	// intent (recreate gen3) wins.
+	put("r1", "dev-F", 1, 10)
+	del("r2", "dev-F")
+	put("r3", "dev-F", 3, 30)
+	w.Drain()
+	show("del+recreate ", "dev-F")
+
+	// 9. bounded queue with backpressure: a full queue rejects new objects with
+	// ErrQueueFull; Stats exposes the backlog.
+	w2 := worker.New(rec, worker.Config{Workers: 2, MaxRetries: 3, BaseBackoff: 1, MaxBackoff: 5, MaxQueueSize: 2})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	w2.Start(ctx2)
+	for i := 0; i < 5; i++ {
+		err := w2.Submit(model.Event{
+			EventID: fmt.Sprintf("b%d", i), Type: model.EventPut,
+			DeviceID: fmt.Sprintf("dev-G%d", i), Feature: "wifi",
+			Spec: &model.Spec{Enabled: true, Mode: "auto", Level: 7}, Generation: 1,
+		})
+		fmt.Printf("[backpressure] submit dev-G%d -> %v\n", i, err)
+	}
+	fmt.Printf("[backpressure] stats while full: %+v\n", w2.Stats())
+	w2.Drain()
+	fmt.Printf("[backpressure] stats after drain: %+v\n", w2.Stats())
+	cancel2()
+	w2.Stop()
 }
